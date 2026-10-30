@@ -1,0 +1,101 @@
+name: Destroy
+
+# Para o custo do EKS. Manual. Último da cadeia de destroy: lambda -> app -> infra-db -> infra-k8s.
+# Não apaga o bucket S3 / DynamoDB do state nem as roles OIDC (setup manual).
+on:
+  workflow_dispatch:
+    inputs:
+      confirm:
+        description: "Digite exatamente destroy para confirmar"
+        required: true
+        type: string
+
+concurrency:
+  group: infra-k8s
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  TF_IN_AUTOMATION: "true"
+  TF_INPUT: "false"
+  AWS_REGION: us-east-1
+  TF_STATE_KEY: tech-challenge/infra-k8s.tfstate
+  SSM_PREFIX: /tech-challenge
+
+jobs:
+  destroy:
+    name: Terraform destroy
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    defaults:
+      run:
+        working-directory: terraform
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Require master branch
+        run: |
+          if [ "${GITHUB_REF}" != "refs/heads/master" ]; then
+            echo "Rode este workflow com a branch master selecionada."
+            exit 1
+          fi
+
+      - name: Confirm destroy
+        env:
+          CONFIRM: ${{ inputs.confirm }}
+        run: |
+          if [ "$CONFIRM" != "destroy" ]; then
+            echo "Abortado: o campo confirm precisa ser exatamente: destroy"
+            exit 1
+          fi
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN_APPLY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      # Fail-fast do contrato: quem depende da rede/cluster precisa ter sido destruído antes.
+      - name: Require dependents destroyed
+        run: |
+          set -eu
+          blocked=0
+          for scope in lambda app db; do
+            names="$(aws ssm get-parameters-by-path --path "${SSM_PREFIX}/${scope}" --recursive \
+              --query 'Parameters[].Name' --output text)"
+            if [ -n "$names" ]; then
+              echo "::error::Ainda existem parâmetros em ${SSM_PREFIX}/${scope}: ${names}. Rode o Destroy desse repositório antes."
+              blocked=1
+            fi
+          done
+          exit "$blocked"
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.9.8"
+          terraform_wrapper: false
+
+      - name: Terraform init
+        run: |
+          terraform init \
+            -backend-config="bucket=${{ vars.TF_STATE_BUCKET }}" \
+            -backend-config="key=${TF_STATE_KEY}" \
+            -backend-config="region=${AWS_REGION}" \
+            -backend-config="dynamodb_table=${{ vars.TF_STATE_LOCK_TABLE }}" \
+            -backend-config="encrypt=true"
+
+      # Os releases Helm (metrics-server, nri-bundle) não criam recursos AWS: somem com o cluster.
+      - name: Terraform destroy
+        env:
+          # O provider New Relic precisa das credenciais para desfazer o vínculo da conta AWS.
+          TF_VAR_newrelic_account_id: ${{ secrets.NEW_RELIC_ACCOUNT_ID }}
+          TF_VAR_newrelic_api_key: ${{ secrets.NEW_RELIC_API_KEY }}
+          TF_VAR_newrelic_region: ${{ vars.NEW_RELIC_REGION || 'US' }}
+          TF_VAR_newrelic_logs_ingest_key: ${{ secrets.NEW_RELIC_LICENSE_KEY }}
+          TF_VAR_newrelic_alert_emails: ${{ vars.NEW_RELIC_ALERT_EMAILS }}
+        run: terraform destroy -auto-approve -var-file=env/aws.tfvars
